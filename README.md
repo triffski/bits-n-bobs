@@ -1,8 +1,5 @@
 # Bits 'n bobs
-# ------------
 
-Scripts and other bits.
-
-| Name | Description |
-|------|-------------|
-| saved_places_to_geojson.py | Convert Google Maps "Saved" list CSVs into one GeoJSON per list, with coordinates. |
+|Name|Description|
+|----|-----------|
+|saved_places_to_geojson.py | Convert Google Maps "Saved" list CSVs into one GeoJSON per list, with coordinates. |
