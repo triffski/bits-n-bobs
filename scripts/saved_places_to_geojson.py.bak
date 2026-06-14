@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+v2 — Convert Google Maps "Saved" list CSVs into per-list GeoJSON, with coordinates.
+
+Improvements over v1 (which was ~50% wrong on generic names):
+  * PER-LIST LOCATION HINTS: appends a region to the query. Edit LIST_HINTS below to taste.
+  * URL COORDINATE EXTRACTION: pulls lat/long from !3dLAT!4dLON and
+    /maps/search/LAT,LON and @LAT,LON patterns.
+  * URL SLUG FALLBACK: if the title fails, retries with the place name parsed
+    from the /maps/place/<NAME>/ slug.
+  * CONFIDENCE in output: every geocoded feature carries importance + match string;
+    low-confidence and no-match entries go to _geocoding_review.csv.
+
+Usage:
+    python3 -m pip install requests --break-system-packages
+    python3 saved_places_to_geojson_v2.py . ./output
+
+Nominatim policy respected: <=1 req/sec, identifying User-Agent. Cache avoids
+re-querying on reruns (delete output/geocode_cache.json to force fresh).
+"""
+
+import csv, glob, json, os, re, sys, time, urllib.parse
+import requests
+
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+USER_AGENT = "triff-saved-places-converter/2.0 (personal use)"
+SLEEP = 1.1
+
+# --- EDIT THESE to match your lists. Key = sanitised list name (filename stem).
+# Value = string appended to every query for that list to anchor the region.
+# Leave a list out (or set "") for globally-scattered lists like Want_to_go.
+LIST_HINTS = {
+    "Liverpool_Pubs": "Liverpool, UK",
+    "Beer_gardens":   "Liverpool, UK",
+    "Vietnam":        "Vietnam",
+    # Favourite_places / Want_to_go : no hint (mixed/global)
+}
+
+coord_patterns = [
+    re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)"),       # embedded in data= (lat,lon)
+    re.compile(r"/maps/search/(-?\d+\.\d+),(-?\d+\.\d+)"),
+    re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)"),
+]
+place_slug_re = re.compile(r"/maps/place/([^/@]+)")
+
+def find_rows(path):
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        lines = list(csv.reader(f))
+    for i, row in enumerate(lines):
+        if row[:3] == ["Title", "Note", "URL"]:
+            hdr = row
+            return [dict(zip(hdr, r + [""]*(len(hdr)-len(r)))) for r in lines[i+1:]]
+    return []
+
+def coords_from_url(url):
+    for rx in coord_patterns:
+        m = rx.search(url or "")
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            # !3d!4d is lat,lon ; search/ and @ are also lat,lon
+            return [lon, lat]
+    return None
+
+def slug_name(url):
+    m = place_slug_re.search(url or "")
+    if m:
+        return urllib.parse.unquote(m.group(1)).replace("+", " ").strip()
+    return None
+
+def geocode(query, cache):
+    if query in cache:
+        return cache[query]
+    try:
+        r = requests.get(NOMINATIM,
+                         params={"q": query, "format": "jsonv2", "limit": 1},
+                         headers={"User-Agent": USER_AGENT}, timeout=20)
+        time.sleep(SLEEP)
+        if r.status_code == 200 and r.json():
+            t = r.json()[0]
+            res = {"lon": float(t["lon"]), "lat": float(t["lat"]),
+                   "importance": t.get("importance"),
+                   "display_name": t.get("display_name")}
+        else:
+            res = None
+    except Exception as e:
+        res = {"error": str(e)}
+    cache[query] = res
+    return res
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python3 saved_places_to_geojson_v2.py <csv_folder> <output_folder>")
+        sys.exit(1)
+    csv_folder, out = sys.argv[1], sys.argv[2]
+    os.makedirs(out, exist_ok=True)
+    cache_path = os.path.join(out, "geocode_cache.json")
+    cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+    review = []
+
+    files = glob.glob(os.path.join(csv_folder, "*.csv"))
+    files += [f for f in glob.glob(os.path.join(csv_folder, "*")) if "homes_and" in os.path.basename(f)]
+    for path in sorted(set(files)):
+        listname = re.sub(r"[^A-Za-z0-9]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("_")
+        hint = LIST_HINTS.get(listname, "")
+        feats = []
+        for row in find_rows(path):
+            title = (row.get("Title") or "").strip()
+            url   = (row.get("URL") or "").strip()
+            note  = (row.get("Note") or "").strip()
+            if not title and not url:
+                continue
+            if "/shopping/" in url or "/product/" in url:
+                continue
+            props = {"name": title, "note": note, "google_maps_url": url, "list": listname}
+
+            # 1) free: coords in URL
+            c = coords_from_url(url)
+            if c:
+                props["coord_source"] = "url"
+                feats.append({"type":"Feature","geometry":{"type":"Point","coordinates":c},"properties":props})
+                continue
+
+            # 2) geocode: title + hint, then slug + hint, then bare title
+            attempts = []
+            if title:
+                attempts.append(f"{title}, {hint}" if hint else title)
+            slug = slug_name(url)
+            if slug and slug.lower() != title.lower():
+                attempts.append(f"{slug}, {hint}" if hint else slug)
+            if hint and title:
+                attempts.append(title)  # last resort: no hint
+
+            best = None
+            for q in attempts:
+                g = geocode(q, cache)
+                if g and "lon" in g:
+                    best = g; best["_query"] = q
+                    if (g.get("importance") or 0) >= 0.4:
+                        break  # confident enough, stop
+            if best and "lon" in best:
+                imp = best.get("importance")
+                props.update(coord_source="nominatim",
+                             geocode_match=best.get("display_name"),
+                             geocode_importance=imp,
+                             geocode_query=best.get("_query"))
+                feats.append({"type":"Feature","geometry":{"type":"Point","coordinates":[best["lon"],best["lat"]]},"properties":props})
+                if imp is None or imp < 0.4:
+                    review.append([listname, title, best.get("display_name"), imp, url])
+            else:
+                review.append([listname, title, "NO MATCH", "", url])
+            json.dump(cache, open(cache_path,"w"))
+
+        json.dump({"type":"FeatureCollection","features":feats},
+                  open(os.path.join(out,f"{listname}.geojson"),"w"), indent=2, ensure_ascii=False)
+        print(f"{listname}: {len(feats)} features")
+
+    if review:
+        with open(os.path.join(out,"_geocoding_review.csv"),"w",newline="",encoding="utf-8") as f:
+            w=csv.writer(f); w.writerow(["list","title","matched_to","importance","url"]); w.writerows(review)
+        print(f"\n{len(review)} flagged for review -> {out}/_geocoding_review.csv")
+    json.dump(cache, open(cache_path,"w"))
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
