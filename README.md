@@ -7,6 +7,9 @@ Somewhere to store random scripts, batch files and whatnot.
 |Name|Description|
 |----|-----------|
 |google_saved_places_exporter.py|Convert custom place lists saved to your Google Maps account into GeoJSON, KML and GPX for use anywhere that imports them (OsmAnd, Organic Maps, etc.). <br><br>Stage 1 geocodes your 'Saved' list CSVs via the Google Places API; Stage 2 (optional) reconstructs the Starred/visited list Takeout won't export; Stage 3 (optional, slow) corrects ambiguous-name mismatches by re-resolving each pin through its real Google Maps URL.|
+|instagram_exif_encombinator.py|Instagram strips EXIF on upload and keeps the real metadata (post dates, captions, GPS)
+in sidecar JSON. This reads `content/posts_*.json` and writes that metadata INTO copies
+of the photos with exiftool. Download your data in JSON format and ensure the script has access to exiftool.|
 
 # Google Saved Places Exporter
   
@@ -42,3 +45,34 @@ This is SLOW: each opens a real browser page and waits for Maps to resolve each 
 - **Cache** absence never breaks a run, it just means that run pays full API price (generally free), then caches the results for next time.
 - **Stage dependency:** Stage 2 excludes places already matched in Stage 1's CSV output. If the merged file is present but the CSVs are **not**, Stage 2 has nothing to exclude against and will reverse-geocode the *entire* merged file as if all of it were Starred (no confirmed matches). Normal use (both present) avoids this.
 - **Name-geocoding caveat:** Stage 1 places each pin by name, so an ambiguous name (e.g. "San José") can resolve to the wrong place — a bar in Dublin rather than the city in Costa Rica. Stage 3 is the fix: it re-resolves every pin from its actual Maps URL and corrects any that are >1km out. If you're skipping Stage 3, you can instead add a region to LIST_HINTS to bias Stage 1's guesses, or spot-fix the outliers by hand after import.
+
+## Instagram EXIF Encombinator
+
+Takes a JSON Instagram export and writes the stripped metadata back to the photos.  
+
+What it does (deliberately basic):
+  - caption (post title)     -> description
+  - post creation_timestamp  -> DateTimeOriginal  (IG keeps no original capture time)
+  - GPS                      -> if present in exif_data (often stripped by IG)
+  - tags                     -> instagram + a dated batch tag (default ig_2026_06)
+  - Carousels: a post's caption + timestamp are fanned out across all its media.
+  - Fixes Instagram's mislabelled files: media whose extension lies about the content
+    (e.g. a JPEG named .webp or .heic) is renamed in the OUTPUT to match the real bytes,
+    sniffed from magic numbers. Genuine WebP/HEIC/PNG files are left as-is. The source
+    is never touched.
+  - No albums   (Instagram has none; use your importer's "into album" option).
+  - No comments (Instagram's export does not include comment threads on your posts).
+
+Input/output folders:
+  --input   is treated as READ-ONLY. Nothing is ever written or renamed there.
+  --output  receives enriched COPIES, mirroring the source's media subfolder structure.
+            Use --clean to wipe it first for a guaranteed fresh rebuild.
+Usage:
+    Look at the export structure first (input only):
+    python3 instagram_exif_encombinator.py --input /data/ig_export/json --inspect
+    
+    Dry run a few items:
+    python3 instagram_exif_encombinator.py --input /data/ig_export/json --output /data/out --dry-run --limit 5
+
+    Real run, wiping output first:
+    python3 instagram_exif_encombinator.py --input /data/ig_export/json --output /data/out --clean
