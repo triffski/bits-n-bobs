@@ -51,8 +51,8 @@ Helper for getting Instagram data into Immich more completely, takes a JSON IG e
 What it does (deliberately basic):
   - caption (post title) -> description → it falls back to media-level title too, so more accurately: caption (post or media title) -> description
   - post creation_timestamp -> DateTimeOriginal → also falls back to media-level timestamp, and for video it writes QuickTime CreateDate, not DateTimeOriginal. So: creation_timestamp -> DateTimeOriginal (photos) / QuickTime CreateDate (video)
-  - GPS                      -> if present in exif_data (often stripped by IG)
-  - tags                     -> instagram + a dated batch tag (default ig_2026_06)
+  - GPS -> if present in exif_data (often stripped by IG)
+  - tags -> instagram + a dated batch tag (default ig_2026_06)
   - Carousels: a post's caption + timestamp are fanned out across all its media.
   - Fixes Instagram's mislabelled files: media whose extension lies about the content
     (e.g. a JPEG named .webp or .heic) is renamed in the OUTPUT to match the real bytes,
@@ -61,22 +61,19 @@ What it does (deliberately basic):
   - No albums (Insta has none)
   - No comments (Instagram's export does not include comment threads on your posts).
 
-Input/output folders:  
-
-  `--input`  is READ-ONLY. Nothing is ever written or renamed there.  
+**Input/output folders:  **
+  `--input`  is READ-ONLY. Nothing is ever written or renamed there.    
+  `--output`  receives enriched COPIES, mirroring the source's media subfolder structure.  
+  Use `--clean` to wipe it first and guarantee a fresh rebuild.  
   
-  `--output`  receives enriched COPIES, mirroring the source's media subfolder structure.vUse  
-  
-  `--clean` to wipe it first and guarantee a fresh rebuild.  
-  
-Usage:  
+**Usage:  **
 Look at the export structure first (input only):  
 `python3 instagram_exif_encombinator.py --input /data/ig_export/json --inspect`
     
-Dry run a few items:  
+**Dry run a few items:  **
 `python3 instagram_exif_encombinator.py --input /data/ig_export/json --output /data/out --dry-run --limit 5`
     
-Real run, wiping output first:  
+**Real run, wiping output first:  **
 `python3 instagram_exif_encombinator.py --input /data/ig_export/json --output /data/out --clean`
 
 ## Next  
@@ -86,3 +83,6 @@ Now you might wanna feed it to immich-go with something like:
   --server=https://YOUR-IMMICH --api-key=KEY \
   --into-album "Instagram" --dry-run \
   /volume1/backup/inputpathmaybeonyournasorsomething`
+
+
+
