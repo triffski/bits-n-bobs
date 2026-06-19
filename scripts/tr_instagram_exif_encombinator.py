@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-instagram_exif_encombinator.py - Enrich an Instagram export with embedded metadata, ready for Immich.
+instagram_exif_encombinator.py - Enrich an Instagram export with embedded metadata,
+ready for Immich.
 
 Instagram strips EXIF on upload and keeps the real metadata (post dates, captions, GPS)
-in sidecar JSON. This reads `content/posts_*.json` and writes that metadata INTO copies
-of the photos with exiftool, so a downstream importer (e.g. immich-go `upload
-from-folder`) and Immich get correct dates, captions and source tags instead of a pile
-of dateless JPEGs all stamped with today's date.
+in sidecar JSON. This reads the export's media-content JSON and writes that metadata
+INTO copies of the photos/videos with exiftool, so a downstream importer (e.g. immich-go
+`upload from-folder`) and Immich get correct dates, captions and source tags instead of
+a pile of dateless files all stamped with today's date.
+
+Content covered (the files that actually reference media):
+    posts_*.json        your feed posts (sharded posts_1.json, posts_2.json, ...)
+    archived_posts.json archived posts
+    reels.json          reels (video)
+    igtv_videos.json    IGTV (video)
+Deliberately ignored: posts.json (a label/activity feed with no media), stories.json,
+profile_photos.json, reposts.json, other_content.json.
 
 What it does (deliberately basic):
-  - caption (post title)     -> description
-  - post creation_timestamp  -> DateTimeOriginal  (IG keeps no original capture time)
-  - GPS                      -> if present in exif_data (often stripped by IG)
-  - tags                     -> instagram + a dated batch tag (default ig_2026_06)
+  - caption (post or media title) -> description
+  - creation_timestamp            -> DateTimeOriginal / QuickTime CreateDate for video
+  - GPS                           -> if present in exif_data (often stripped by IG)
+  - tags                          -> instagram + a dated batch tag (default ig_2026_06)
   - Carousels: a post's caption + timestamp are fanned out across all its media.
   - Fixes Instagram's mislabelled files: media whose extension lies about the content
     (e.g. a JPEG named .webp or .heic) is renamed in the OUTPUT to match the real bytes,
-    sniffed from magic numbers. Genuine WebP/HEIC/PNG files are left as-is. The source
-    is never touched.
+    sniffed from magic numbers. Genuine WebP/HEIC/PNG files are left as-is.
   - No albums   (Instagram has none; use your importer's "into album" option).
   - No comments (Instagram's export does not include comment threads on your posts).
 
@@ -54,11 +62,18 @@ SOURCE_TAG = "instagram"
 DEFAULT_IMPORT_TAG = "ig_2026_06"   # override per-run with --import-tag
 PROGRESS_EVERY = 100                # print a progress line every N media
 
-# posts content files, searched recursively under --input
-POSTS_GLOBS = ["**/content/posts_*.json", "**/posts_*.json"]
+# Content files that reference real media, searched recursively under --input.
+# NOTE: "posts_*.json" matches the sharded post files (posts_1.json, ...) but NOT
+# "posts.json", which is a label/activity feed with no media and must be excluded.
+CONTENT_GLOBS = [
+    "**/posts_*.json",
+    "**/archived_posts.json",
+    "**/reels.json",
+    "**/igtv_videos.json",
+]
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
-TZ_OFFSET_HOURS = 0                 # FB/IG epochs are UTC; DateTimeOriginal is tz-naive
+TZ_OFFSET_HOURS = 0                 # IG epochs are UTC; DateTimeOriginal is tz-naive
 
 
 # ----------------------------------------------------------------------------
@@ -97,8 +112,9 @@ def ts_to_exif(ts):
     return dt.strftime("%Y:%m:%d %H:%M:%S")
 
 
-def posts_from(data):
-    """posts_*.json is normally a bare list; tolerate a dict wrapper too."""
+def entries_from(data):
+    """The content files are either a bare list of items, or a dict wrapping one list
+    (reels/igtv/archived). Return the list of items either way."""
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -119,8 +135,8 @@ def gps_from(media):
 
 
 def detect_export_root(input_dir):
-    """uris in posts_*.json resolve relative to the export root (the dir holding
-    'media/'). Find it; fall back to input_dir."""
+    """uris resolve relative to the export root (the dir holding 'media/'). Find it;
+    fall back to input_dir."""
     for d in input_dir.rglob("media"):
         if d.is_dir():
             return d.parent
@@ -129,10 +145,10 @@ def detect_export_root(input_dir):
 
 def real_image_ext(path):
     """Sniff the true image format from magic bytes and return the matching extension
-    (e.g. '.jpg'), or None if unknown. Instagram frequently mislabels JPEGs as .webp or
-    .heic; exiftool refuses to write when the extension contradicts the content, so we
-    rename the output copy to match reality. Genuine formats return their own extension
-    (so no rename happens)."""
+    (e.g. '.jpg'), or None if unknown/not an image. Instagram frequently mislabels
+    JPEGs as .webp or .heic; exiftool refuses to write when the extension contradicts
+    the content, so we rename the output copy to match reality. Genuine formats return
+    their own extension (so no rename happens)."""
     try:
         with open(path, "rb") as f:
             head = f.read(16)
@@ -217,47 +233,47 @@ def build_exiftool_cmd(path, ts, lat, lon, description, import_tag):
 # ----------------------------------------------------------------------------
 # Load + count
 # ----------------------------------------------------------------------------
-def collect_posts(posts_files):
-    """Pass 1: load every posts file once, return (all_posts, parse_failures)."""
-    all_posts, failures = [], 0
-    for pf in posts_files:
-        data = load_json(pf)
+def collect_entries(content_files):
+    """Pass 1: load every content file once, return (all_entries, parse_failures)."""
+    all_entries, failures = [], 0
+    for cf in content_files:
+        data = load_json(cf)
         if data is None:
             failures += 1
             continue
-        all_posts.extend(posts_from(data))
-    return all_posts, failures
+        all_entries.extend(entries_from(data))
+    return all_entries, failures
 
 
 # ----------------------------------------------------------------------------
 # Inspect
 # ----------------------------------------------------------------------------
-def inspect(input_dir, export_root, posts_files):
+def inspect(input_dir, export_root, content_files):
     print(f"\nInput:                {input_dir}")
     print(f"Detected export root: {export_root}")
-    print(f"posts_*.json found:   {len(posts_files)}")
-    for p in posts_files[:10]:
+    print(f"content files found:  {len(content_files)}")
+    for p in content_files:
         print(f"  - {p.relative_to(input_dir)}")
-    if not posts_files:
-        print("\n  No posts files matched POSTS_GLOBS - check the patterns at the top.")
+    if not content_files:
+        print("\n  No content files matched CONTENT_GLOBS - check the patterns at the top.")
         return
 
-    data = load_json(posts_files[0])
-    posts = posts_from(data)
-    print(f"\nPosts in first file: {len(posts)}")
-    if posts:
-        p0 = posts[0]
-        print(f"Post-level keys: {sorted(p0.keys()) if isinstance(p0, dict) else type(p0)}")
-        media = p0.get("media") or []
+    data = load_json(content_files[0])
+    entries = entries_from(data)
+    print(f"\nEntries in {content_files[0].name}: {len(entries)}")
+    if entries:
+        e0 = entries[0]
+        print(f"Entry keys: {sorted(e0.keys()) if isinstance(e0, dict) else type(e0)}")
+        media = e0.get("media") or []
         print(f"media[] count (carousel size): {len(media)}")
         if media:
             print(f"media[0] keys: {sorted(media[0].keys())}")
             uri = media[0].get("uri")
             resolved = export_root / uri if uri else None
-            cap = fix_mojibake(p0.get("title") or media[0].get("title") or "")
-            ts = p0.get("creation_timestamp") or media[0].get("creation_timestamp")
+            cap = fix_mojibake(e0.get("title") or media[0].get("title") or "")
+            ts = e0.get("creation_timestamp") or media[0].get("creation_timestamp")
             lat, lon = gps_from(media[0])
-            print("\nWhat would be extracted from post #1, media #0:")
+            print("\nWhat would be extracted from entry #1, media #0:")
             print(f"  uri:        {uri}")
             print(f"  resolves:   {resolved}  exists={resolved.exists() if resolved else False}")
             print(f"  timestamp:  {ts} -> {ts_to_exif(ts) if ts else '(none)'}")
@@ -271,9 +287,9 @@ def inspect(input_dir, export_root, posts_files):
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Embed Instagram JSON metadata into photo copies, ready for Immich.")
+        description="Embed Instagram JSON metadata into photo/video copies, ready for Immich.")
     ap.add_argument("-i", "--input", required=True,
-                    help="Source export dir (READ-ONLY). The folder containing content/posts_*.json")
+                    help="Source export dir (READ-ONLY). The folder containing the IG JSON export")
     ap.add_argument("-o", "--output",
                     help="Destination dir for enriched copies (required unless --inspect)")
     ap.add_argument("--clean", action="store_true",
@@ -299,25 +315,27 @@ def main():
 
     export_root = detect_export_root(input_dir)
 
-    seen, posts_files = set(), []
-    for g in POSTS_GLOBS:
+    seen, content_files = set(), []
+    for g in CONTENT_GLOBS:
         for p in input_dir.glob(g):
             if p.is_file() and p not in seen:
                 seen.add(p)
-                posts_files.append(p)
+                content_files.append(p)
+    content_files.sort()
 
     if args.inspect:
-        inspect(input_dir, export_root, posts_files)
+        inspect(input_dir, export_root, content_files)
         return
 
-    if not posts_files:
-        sys.exit("FATAL: no posts_*.json found. Run --inspect and check POSTS_GLOBS.")
+    if not content_files:
+        sys.exit("FATAL: no content files found. Run --inspect and check CONTENT_GLOBS.")
 
-    # Pass 1: load posts and count total media for the progress readout.
-    all_posts, failed = collect_posts(posts_files)
-    total_media = sum(len(p.get("media") or []) for p in all_posts)
+    # Pass 1: load content and count total media for the progress readout.
+    all_entries, failed = collect_entries(content_files)
+    total_media = sum(len(e.get("media") or []) for e in all_entries)
     display_total = min(args.limit, total_media) if args.limit else total_media
-    print(f"Found {total_media} media across {len(all_posts)} posts"
+    print(f"Found {total_media} media across {len(all_entries)} entries "
+          f"in {len(content_files)} content files"
           + (f" (processing first {display_total})" if args.limit else "") + "\n")
 
     if args.clean and not args.dry_run:
@@ -325,11 +343,11 @@ def main():
 
     # Pass 2: copy + enrich.
     ok = skipped = renamed = processed = 0
-    for post in all_posts:
-        caption = fix_mojibake(post.get("title") or "")
-        post_ts = post.get("creation_timestamp")
+    for entry in all_entries:
+        caption = fix_mojibake(entry.get("title") or "")
+        entry_ts = entry.get("creation_timestamp")
 
-        for m in (post.get("media") or []):
+        for m in (entry.get("media") or []):
             if args.limit and processed >= args.limit:
                 break
             processed += 1
@@ -343,7 +361,7 @@ def main():
                     print(f"  !! missing source: {uri}", file=sys.stderr)
                     skipped += 1
                 else:
-                    ts = post_ts or m.get("creation_timestamp")
+                    ts = entry_ts or m.get("creation_timestamp")
                     cap = caption or fix_mojibake(m.get("title") or "")
                     lat, lon = gps_from(m)
 
